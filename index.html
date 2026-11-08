@@ -130,6 +130,7 @@
     settleSec: 0.3,     // secondi a bicchieri fermi prima di dare la risposta
     maxHyps: 24,
     staticFactor: 4,
+    minTopFrac: 0.22,   // area minima di un fondo (frazione) quando i fondi sono bianchi
     recalib: 2,         // ricalibra ogni N secondi a bicchieri fermi (0 = mai)
     adaptive: true,     // soglia che segue l'esposizione automatica
     depthWeight: 4,     // peso degli spostamenti verticali (profondità): cambiano lentamente // penalità del modello "fermo" rispetto a "velocità costante"
@@ -164,6 +165,7 @@
       this.thrRatio = null;
       this.refS = null;
       this.relock = false;
+      this.tintReq = 0;
       this.needCalib = false;
       this.badFrames = 0;
       this.answer = null;
@@ -175,12 +177,14 @@
       const luma = new Uint8Array(n);
       const blueish = new Uint8Array(n);
       const yellow = new Uint8Array(n);
+      const tint = new Int16Array(n);        // b - r: i fondi di molti giochi sono azzurri, le scritte bianche
+      this._tint = tint;
       const hist = new Uint32Array(256);
       let nb = 0;
       for (let i = 0, j = 0; i < n; i++, j += 4) {
         const r = px[j], g = px[j + 1], b = px[j + 2];
         const L = (r * 77 + g * 150 + b * 29) >> 8;
-        luma[i] = L;
+        luma[i] = L; tint[i] = b - r;
         if (b >= r - 18 && b >= g - 30) { blueish[i] = 1; hist[L]++; nb++; }
         if (r > 80 && g > 0.76 * r && g < 1.1 * r && b < 0.62 * r && r - b > 45 && g - b > 35) yellow[i] = 1;
       }
@@ -191,7 +195,7 @@
         // l'esposizione automatica della fotocamera cambia la luminosità: la soglia la segue
         this.refS = this.refS ? 0.92 * this.refS + 0.08 * ref : ref;
         const c = this.thrCal;
-        this.thr = Math.min(1.3 * c, Math.max(0.7 * c, this.thrRatio * this.refS));
+        this.thr = Math.min(2.0 * c, Math.max(0.5 * c, this.thrRatio * this.refS));
       }
       const thr = this.thr || 128;
       const top = this._topMask(luma, blueish, w, h, thr);
@@ -219,9 +223,11 @@
       return 0;
     }
 
-    _topMask(luma, blueish, w, h, thr) {
+    _topMask(luma, blueish, w, h, thr, noTint) {
       const n = w * h, top = new Uint8Array(n);
-      for (let i = 0; i < n; i++) if (blueish[i] && luma[i] >= thr) top[i] = 1;
+      const tr = noTint ? 0 : (this.tintReq || 0), tint = this._tint;
+      if (tr > 0) { for (let i = 0; i < n; i++) if (blueish[i] && luma[i] >= thr && tint[i] >= tr) top[i] = 1; }
+      else for (let i = 0; i < n; i++) if (blueish[i] && luma[i] >= thr) top[i] = 1;
       return erode(top, w, h);
     }
 
@@ -229,9 +235,10 @@
     _calibrate(luma, blueish, w, h, ref) {
       const ok = [];
       const minA = Math.max(12, (w * h) / 900);
-      for (let t = 48; t <= 250; t += 6) {
-        const comps = components(this._topMask(luma, blueish, w, h, t), w, h, false).filter(c => c.area >= minA);
-        ok.push({ t, good: !!findCupTriple(comps) });
+      const minW = 0.07 * w;                 // un fondo è almeno il 7% della larghezza del riquadro
+      for (let t = 48; t <= 248; t += 8) {
+        const comps = components(this._topMask(luma, blueish, w, h, t, true), w, h, false).filter(c => c.area >= minA);
+        ok.push({ t, good: !!findCupTriple(comps, minW) });
       }
       // intervalli contigui di soglie valide: si prende quello PIÙ LUMINOSO abbastanza largo
       // (i fondi sono la parte più chiara; a soglie basse si rischia di prendere i corpi)
@@ -240,13 +247,13 @@
         if (o.good) { if (!cur) { cur = { a: o.t, b: o.t }; runs.push(cur); } else cur.b = o.t; }
         else cur = null;
       }
-      const wide = runs.filter(r => r.b - r.a >= 12);
+      const wide = runs.filter(r => r.b - r.a >= 16);
       const best = wide.length ? wide[wide.length - 1] : null;
       if (best) {
         this.thr = (best.a + best.b) / 2; this.calibrated = true; this.thrCal = this.thr;
         // fissa subito la fascia dei bicchieri e la dimensione dei fondi
-        const comps = components(this._topMask(luma, blueish, w, h, this.thr), w, h, false).filter(c => c.area >= minA);
-        const tri = findCupTriple(comps);
+        const comps = components(this._topMask(luma, blueish, w, h, this.thr, true), w, h, true).filter(c => c.area >= minA);
+        const tri = findCupTriple(comps, minW);
         if (tri) {
           const xs = tri.map(c => c.cx);
           const ny = (tri[0].cy + tri[1].cy + tri[2].cy) / 3;
@@ -257,6 +264,12 @@
             this.topW = ws[1];
             this.topArea = tri.map(c => c.area).sort((a, b) => a - b)[1];
           }
+          // tinta tipica dei fondi: se sono chiaramente azzurri, d'ora in poi si scartano i pixel bianchi (scritte)
+          const tv = [];
+          for (const c of tri) for (let k = 0; k < c.pix.length; k += 3) tv.push(this._tint[c.pix[k]]);
+          tv.sort((a, b) => a - b);
+          const med = tv.length ? tv[tv.length >> 1] : 0;
+          this.tintReq = med >= 60 ? Math.round(med * 0.45) : 0;
           ref = this._refLuma(luma, blueish, w, h);
         }
         this.thrRatio = ref > 0 ? this.thr / ref : null;
@@ -268,7 +281,7 @@
     // ------------------------------------------------------------ rilevamento fondi
     _detectTops(mask, w, h) {
       const comps = components(mask, w, h, true);
-      const minA = this.topArea ? this.topArea * 0.22 : Math.max(12, (w * h) / 900);
+      const minA = this.topArea ? this.topArea * (this.tintReq ? 0.22 : this.o.minTopFrac) : Math.max(12, (w * h) / 900);
       // scarta ciò che tocca il bordo alto/basso del riquadro (numeri, scritte tagliate)
       const big = comps.filter(c => c.area >= minA && c.miny > 0 && c.maxy < h - 1);
 
@@ -414,15 +427,16 @@
       let dets = this._detectTops(top, w, h);
       let ball = this._detectBall(yellow, w, h);
       // fuori dalla fascia dei bicchieri (scritte, numero del livello, barra del tempo) → ignora
+      if (dets.length > 6) dets = dets.sort((a, b) => b.area - a.area).slice(0, 6);   // prestazioni
       const B = this.band, twb = this.topW || 30;
       if (B) {
         dets = dets.filter(d => d.x > B.minX - 1.3 * twb && d.x < B.maxX + 1.3 * twb &&
-                                d.y > B.y - 1.8 * twb && d.y < B.y + 1.5 * twb);
+                                d.y > B.y - 2.6 * twb && d.y < B.y + 1.5 * twb);
         if (ball && !(ball.x > B.minX - 1.3 * twb && ball.x < B.maxX + 1.3 * twb &&
                       ball.y > B.y - 1.2 * twb && ball.y < B.y + 2.8 * twb)) ball = null;
       }
       this.badFrames = dets.length === this.o.nCups ? 0 : this.badFrames + 1;
-      if ((!this.calibrated && this.frame % 10 === 0) || this.badFrames > 60) { this.needCalib = true; this.badFrames = 0; }
+      if ((!this.calibrated && this.frame % 30 === 0) || this.badFrames > 90) { this.needCalib = true; this.badFrames = 0; }
       const tw = this.topW || 30;
 
       if (this.relock && this.hyps) {
@@ -622,8 +636,9 @@
   // 3 fondi plausibili: ellissi simili, allineate in orizzontale e distanziate
   // (esclude scritte, numeri del livello, barre)
   // fra più componenti (bicchieri + scritte) trova la terna di fondi più plausibile
-  function findCupTriple(comps) {
-    const C = comps.filter(isEllipseLike).slice(0, 12);
+  function findCupTriple(comps, minW) {
+    const C = comps.filter(c => isEllipseLike(c) && (!minW || c.maxx - c.minx + 1 >= minW))
+      .sort((a, b) => b.area - a.area).slice(0, 10);
     let best = null, bs = Infinity;
     for (let i = 0; i < C.length; i++) for (let j = i + 1; j < C.length; j++) for (let k = j + 1; k < C.length; k++) {
       const t = [C[i], C[j], C[k]];
@@ -1003,7 +1018,7 @@ function draw() {
   // in debug: mostra la fascia in cui cerca i bicchieri
   if (debug && tracker.band) {
     const B = tracker.band, tw0 = tracker.topW || 30;
-    const a = workToScreen(B.minX - 1.3 * tw0, B.y - 1.8 * tw0), b = workToScreen(B.maxX + 1.3 * tw0, B.y + 1.5 * tw0);
+    const a = workToScreen(B.minX - 1.3 * tw0, B.y - 2.6 * tw0), b = workToScreen(B.maxX + 1.3 * tw0, B.y + 1.5 * tw0);
     octx.strokeStyle = '#00e5ff80'; octx.setLineDash([4, 4]); octx.lineWidth = 1;
     octx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y); octx.setLineDash([]);
   }
