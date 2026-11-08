@@ -77,6 +77,7 @@
     <button id="bDebug">Debug: no</button>
     <label class="btn">Prova con un video<input id="file" type="file" accept="video/*" hidden></label>
     <button id="bHelp">Come si usa</button>
+    <button id="bLow">Leggera: no</button>
   </div>
   <div class="row">
     <span>Soglia fondi</span>
@@ -92,12 +93,13 @@
   <ol>
     <li>Appoggia il telefono su un supporto fermo, davanti allo schermo con il gioco.</li>
     <li>Premi <b>Avvia</b> e consenti l'uso della fotocamera.</li>
-    <li>Premi <b>Zona</b> e trascina un rettangolo attorno al tavolo, <b>con lo spazio sopra i bicchieri</b> (si sollevano). Lascia fuori numeri e scritte.</li>
+    <li>Premi <b>Zona</b> e trascina un rettangolo attorno al tavolo, <b>con lo spazio sopra i bicchieri</b> (si sollevano) e la pallina sotto. <b>Lascia fuori</b> il numero del livello, le scritte («Osserva la pallina», «Tocca il bicchiere») e la barra gialla del tempo.</li>
     <li>Fai partire il round: quando vede la pallina, la segue. A bicchieri fermi compare la risposta e un cerchio giallo sul bicchiere.</li>
     <li>Se perde il filo, premi <b>Nuovo</b> prima del round successivo.</li>
   </ol>
-  <small>Consigli: schermo del gioco luminoso, stanza non buia, niente riflessi.
-  In basso a destra vedi i fotogrammi al secondo: con 50–60 vanno i livelli alti, con 30 solo quelli medi.</small>
+  <small>Consigli: schermo del gioco al massimo della luminosità, niente riflessi.
+  In basso a destra: «fps reali» = fotogrammi consegnati dalla fotocamera, «fps elaborati» = quelli analizzati.
+  Con 50–60 vanno i livelli alti, con 30 solo quelli medi. Se gli fps reali sono 60 ma quelli elaborati molto meno, prova «Leggera» in ⋯.</small>
   <div class="row"><button id="bHelpClose">Chiudi</button></div>
 </div>
 
@@ -128,6 +130,8 @@
     settleSec: 0.3,     // secondi a bicchieri fermi prima di dare la risposta
     maxHyps: 24,
     staticFactor: 4,
+    recalib: 2,         // ricalibra ogni N secondi a bicchieri fermi (0 = mai)
+    adaptive: true,     // soglia che segue l'esposizione automatica
     depthWeight: 4,     // peso degli spostamenti verticali (profondità): cambiano lentamente // penalità del modello "fermo" rispetto a "velocità costante"
   };
 
@@ -155,6 +159,11 @@
       this.collapsed = 0;
       this.thr = null;
       this.calibrated = false;
+      this.band = null;
+      this.lastCalibT = 0;
+      this.thrRatio = null;
+      this.refS = null;
+      this.relock = false;
       this.needCalib = false;
       this.badFrames = 0;
       this.answer = null;
@@ -175,12 +184,39 @@
         if (b >= r - 18 && b >= g - 30) { blueish[i] = 1; hist[L]++; nb++; }
         if (r > 80 && g > 0.76 * r && g < 1.1 * r && b < 0.62 * r && r - b > 45 && g - b > 35) yellow[i] = 1;
       }
+      const ref = this._refLuma(luma, blueish, w, h);
       if (this.o.manualThr) this.thr = this.o.manualThr;
-      else if (this.thr == null || this.needCalib) { this._calibrate(luma, blueish, w, h); this.needCalib = false; }
+      else if (this.thr == null || this.needCalib) { this._calibrate(luma, blueish, w, h, ref); this.needCalib = false; }
+      else if (this.thrRatio && ref > 0 && this.o.adaptive) {
+        // l'esposizione automatica della fotocamera cambia la luminosità: la soglia la segue
+        this.refS = this.refS ? 0.92 * this.refS + 0.08 * ref : ref;
+        const c = this.thrCal;
+        this.thr = Math.min(1.3 * c, Math.max(0.7 * c, this.thrRatio * this.refS));
+      }
       const thr = this.thr || 128;
       const top = this._topMask(luma, blueish, w, h, thr);
       this.debug = { top, yellow, w, h };
       return { top, yellow, thr };
+    }
+
+    // luminosità di riferimento: 99° percentile dei pixel bluastri nella fascia dei bicchieri
+    _refLuma(luma, blueish, w, h) {
+      const hist = new Uint32Array(256);
+      let x0 = 0, x1 = w, y0 = 0, y1 = h;
+      const B = this.band, tw = this.topW || 30;
+      if (B) {
+        x0 = Math.max(0, Math.floor(B.minX - 1.3 * tw)); x1 = Math.min(w, Math.ceil(B.maxX + 1.3 * tw));
+        y0 = Math.max(0, Math.floor(B.y - 2.2 * tw)); y1 = Math.min(h, Math.ceil(B.y + 1.5 * tw));
+      }
+      let n = 0;
+      for (let y = y0; y < y1; y++) for (let x = x0, i = y * w + x0; x < x1; x++, i++) if (blueish[i]) { hist[luma[i]]++; n++; }
+      if (!n) return 0;
+      // luminosità dei pixel più chiari pari a circa un fondo (anche con bicchieri sovrapposti
+      // almeno un fondo intero si vede)
+      const tgt = Math.max(10, (this.topArea || 60) * 0.8);
+      let acc = 0;
+      for (let L = 255; L >= 0; L--) { acc += hist[L]; if (acc >= tgt) return L; }
+      return 0;
     }
 
     _topMask(luma, blueish, w, h, thr) {
@@ -190,32 +226,51 @@
     }
 
     // cerca la soglia di luminosità che separa esattamente 3 fondi di area simile
-    _calibrate(luma, blueish, w, h) {
+    _calibrate(luma, blueish, w, h, ref) {
       const ok = [];
       const minA = Math.max(12, (w * h) / 900);
-      for (let t = 30; t <= 250; t += 6) {
+      for (let t = 48; t <= 250; t += 6) {
         const comps = components(this._topMask(luma, blueish, w, h, t), w, h, false).filter(c => c.area >= minA);
-        let good = false;
-        if (comps.length === this.o.nCups) {
-          const a = comps.map(c => c.area).sort((x, y) => x - y);
-          good = a[a.length - 1] < 2.0 * a[0] && comps.every(isEllipseLike);
-        }
-        ok.push({ t, good });
+        ok.push({ t, good: !!findCupTriple(comps) });
       }
-      // run contiguo più lungo di soglie valide → prendi il centro
-      let best = null, cur = null;
+      // intervalli contigui di soglie valide: si prende quello PIÙ LUMINOSO abbastanza largo
+      // (i fondi sono la parte più chiara; a soglie basse si rischia di prendere i corpi)
+      const runs = []; let cur = null;
       for (const o of ok) {
-        if (o.good) { if (!cur) cur = { a: o.t, b: o.t }; else cur.b = o.t; if (!best || cur.b - cur.a > best.b - best.a) best = { ...cur }; }
+        if (o.good) { if (!cur) { cur = { a: o.t, b: o.t }; runs.push(cur); } else cur.b = o.t; }
         else cur = null;
       }
-      if (best) { this.thr = (best.a + best.b) / 2; this.calibrated = true; }
+      const wide = runs.filter(r => r.b - r.a >= 12);
+      const best = wide.length ? wide[wide.length - 1] : null;
+      if (best) {
+        this.thr = (best.a + best.b) / 2; this.calibrated = true; this.thrCal = this.thr;
+        // fissa subito la fascia dei bicchieri e la dimensione dei fondi
+        const comps = components(this._topMask(luma, blueish, w, h, this.thr), w, h, false).filter(c => c.area >= minA);
+        const tri = findCupTriple(comps);
+        if (tri) {
+          const xs = tri.map(c => c.cx);
+          const ny = (tri[0].cy + tri[1].cy + tri[2].cy) / 3;
+          if (this.band && Math.abs(ny - this.band.y) > 0.4 * (this.topW || 30)) this.relock = true;  // ora vede parti diverse
+          this.band = { minX: Math.min(...xs), maxX: Math.max(...xs), y: (tri[0].cy + tri[1].cy + tri[2].cy) / 3 };
+          const ws = tri.map(c => c.maxx - c.minx + 1).sort((a, b) => a - b);
+          if (!this.topW || Math.abs(ws[1] - this.topW) > 0.25 * this.topW) {
+            this.topW = ws[1];
+            this.topArea = tri.map(c => c.area).sort((a, b) => a - b)[1];
+          }
+          ref = this._refLuma(luma, blueish, w, h);
+        }
+        this.thrRatio = ref > 0 ? this.thr / ref : null;
+        this.refS = ref || null;
+      }
+      this.lastCalibT = this.t;
     }
 
     // ------------------------------------------------------------ rilevamento fondi
     _detectTops(mask, w, h) {
       const comps = components(mask, w, h, true);
       const minA = this.topArea ? this.topArea * 0.22 : Math.max(12, (w * h) / 900);
-      const big = comps.filter(c => c.area >= minA);
+      // scarta ciò che tocca il bordo alto/basso del riquadro (numeri, scritte tagliate)
+      const big = comps.filter(c => c.area >= minA && c.miny > 0 && c.maxy < h - 1);
 
       // apprendimento dimensione tipica: 3 componenti di area simile
       if (big.length === this.o.nCups) {
@@ -343,7 +398,7 @@
       if (best && best.owner >= 0) {
         const o = best.tracks[best.owner];
         let bd = Infinity;
-        nt.forEach((t, i) => { const d = (t.x - o.x) ** 2 + (t.y - o.y) ** 2; if (d < bd) { bd = d; owner = i; } });
+        nt.forEach((t, i) => { const d = Math.abs(t.x - o.x); if (d < bd) { bd = d; owner = i; } });   // solo x: a riposo sono allineati
       }
       this.hyps = [{ tracks: nt, owner, cost: 0, epStart: -1, epFinal: null }];
     }
@@ -356,14 +411,27 @@
       this.frame++;
       this.t = t != null ? t : this.frame / 30;
       const { top, yellow, thr } = this._masks(px, w, h);
-      const dets = this._detectTops(top, w, h);
-      const ball = this._detectBall(yellow, w, h);
+      let dets = this._detectTops(top, w, h);
+      let ball = this._detectBall(yellow, w, h);
+      // fuori dalla fascia dei bicchieri (scritte, numero del livello, barra del tempo) → ignora
+      const B = this.band, twb = this.topW || 30;
+      if (B) {
+        dets = dets.filter(d => d.x > B.minX - 1.3 * twb && d.x < B.maxX + 1.3 * twb &&
+                                d.y > B.y - 1.8 * twb && d.y < B.y + 1.5 * twb);
+        if (ball && !(ball.x > B.minX - 1.3 * twb && ball.x < B.maxX + 1.3 * twb &&
+                      ball.y > B.y - 1.2 * twb && ball.y < B.y + 2.8 * twb)) ball = null;
+      }
       this.badFrames = dets.length === this.o.nCups ? 0 : this.badFrames + 1;
       if ((!this.calibrated && this.frame % 10 === 0) || this.badFrames > 60) { this.needCalib = true; this.badFrames = 0; }
       const tw = this.topW || 30;
 
+      if (this.relock && this.hyps) {
+        const tri = findDetTriple(dets, this.topW || 30);
+        if (tri) { this._initTracks(tri); this.relock = false; }
+      }
       if (!this.hyps) {
-        if (dets.length === this.o.nCups) this._initTracks(dets);
+        const tri = findDetTriple(dets, this.topW || 30);
+        if (tri) this._initTracks(tri);
       } else {
         const prevBest = this.hyps[0].tracks;
         // espansione ipotesi
@@ -412,6 +480,18 @@
         } else if (netMove >= tw * 0.2) { this.stillFrames = 0; this.stillSince = null; this.movingFrames++; }
         if (motion > tw * 0.5) this.sinceFast = 0; else this.sinceFast++;
         // quota di riposo dei fondi (media delle 3 tracce a bicchieri fermi, senza pallina)
+        if (this.stillFrames > 5 && !ball && dets.length === 3 && isAlignedTriple(dets, tw)) {
+          const xs = dets.map(d => d.x), my = (dets[0].y + dets[1].y + dets[2].y) / 3;
+          const nb = { minX: Math.min(...xs), maxX: Math.max(...xs), y: my };
+          this.band = this.band ? { minX: 0.8 * this.band.minX + 0.2 * nb.minX, maxX: 0.8 * this.band.maxX + 0.2 * nb.maxX, y: 0.8 * this.band.y + 0.2 * nb.y } : nb;
+          const T = this.hyps[0].tracks;
+          // tracce che non coincidono coi 3 fondi (es. agganciate a una scritta) per ~0.4 s → riaggancia
+          const off = dets.some(d => Math.min(...T.map(t => Math.hypot(t.x - d.x, t.y - d.y))) > 0.8 * tw);
+          this.offFrames = off ? (this.offFrames || 0) + 1 : 0;
+          if (this.offFrames > 12) { this._initTracks(dets); this.offFrames = 0; }
+        }
+        // ricalibrazione periodica a bicchieri fermi (l'esposizione e l'inquadratura cambiano)
+        if (this.o.recalib && this.stillFrames > 6 && !this.ep && this.t - (this.lastCalibT || 0) > this.o.recalib) this.needCalib = true;
         if (this.stillFrames > 5 && !ball) {
           const my = T0mean(this.hyps[0].tracks);
           this.baseY = this.baseY == null ? my : 0.9 * this.baseY + 0.1 * my;
@@ -439,13 +519,15 @@
       if (this.hyps) {
         if (ball) {
           if (!this.ep) {
-            this.ep = { pts: [], gap: 0, shuffling: this.sinceFast < 12, twoLifted: false };
+            this.ep = { pts: [], gap: 0, shuffling: this.sinceFast < 12, twoLifted: false, t0: this.t };
             for (const hy of this.hyps) { hy.epStart = hy.owner; hy.epFinal = null; }
           }
           this.ep.pts.push(ball); this.ep.gap = 0;
           // scambio = DUE bicchieri sollevati insieme (lo svelamento ne alza uno solo)
-          if (this.baseY != null) {
-            const lifted = this.hyps[0].tracks.filter(t => t.y < this.baseY - 0.4 * tw).length;
+          // (confronto col bicchiere più in basso, così lo spostamento del telefono non conta)
+          {
+            const T = this.hyps[0].tracks, low = Math.max(...T.map(t => t.y));
+            const lifted = T.filter(t => t.y < low - 0.4 * tw).length;
             if (lifted >= 2) this.ep.twoLifted = true;
           }
           for (const hy of this.hyps) {
@@ -507,7 +589,8 @@
         .sort((a, b) => a.c - b.c);
       if (ranked[0].c > tw * 1.6) return { live: -1, final: -1 };
       const live = ranked[0].i;
-      const exchange = this.baseY != null ? ep.twoLifted : ep.shuffling;
+      // scambio: due bicchieri sollevati e pallina visibile per poco (lo svelamento dura ~1 s)
+      const exchange = ep.twoLifted && (this.t - ep.t0) < 0.7;
       if (!exchange) return { live, final: live };                       // svelamento
       const two = ranked.slice(0, 2);
       if (ranked[1].c > tw * 1.6) return { live, final: live };
@@ -536,10 +619,52 @@
   // ================================================================ utilità
   function T0mean(T) { let s = 0; for (const t of T) s += t.y; return s / T.length; }
   // un fondo di bicchiere è un'ellisse piena, più larga che alta
+  // 3 fondi plausibili: ellissi simili, allineate in orizzontale e distanziate
+  // (esclude scritte, numeri del livello, barre)
+  // fra più componenti (bicchieri + scritte) trova la terna di fondi più plausibile
+  function findCupTriple(comps) {
+    const C = comps.filter(isEllipseLike).slice(0, 12);
+    let best = null, bs = Infinity;
+    for (let i = 0; i < C.length; i++) for (let j = i + 1; j < C.length; j++) for (let k = j + 1; k < C.length; k++) {
+      const t = [C[i], C[j], C[k]];
+      if (!isCupTriple(t)) continue;
+      const a = t.map(c => c.area);
+      if (Math.max(...a) > 2 * Math.min(...a)) continue;
+      const ys = t.map(c => c.cy), sc = Math.max(...ys) - Math.min(...ys) - Math.min(...a) * 1e-3;
+      if (sc < bs) { bs = sc; best = t; }
+    }
+    return best;
+  }
+  function isCupTriple(comps) {
+    if (comps.length !== 3 || !comps.every(isEllipseLike)) return false;
+    const ws = comps.map(c => c.maxx - c.minx + 1);
+    const mw = ws.reduce((a, b) => a + b, 0) / 3;
+    if (Math.max(...ws) > 1.6 * Math.min(...ws)) return false;
+    return isAlignedTriple(comps.map(c => ({ x: c.cx, y: c.cy })), mw);
+  }
+  function findDetTriple(D, tw) {
+    if (D.length < 3) return null;
+    let best = null, bs = Infinity;
+    for (let i = 0; i < D.length; i++) for (let j = i + 1; j < D.length; j++) for (let k = j + 1; k < D.length; k++) {
+      const t = [D[i], D[j], D[k]];
+      if (!isAlignedTriple(t, tw)) continue;
+      const a = t.map(d => d.area || 1);
+      if (Math.max(...a) > 2.2 * Math.min(...a)) continue;
+      const ys = t.map(d => d.y), sc = Math.max(...ys) - Math.min(...ys);
+      if (sc < bs) { bs = sc; best = t; }
+    }
+    return best;
+  }
+  function isAlignedTriple(P, tw) {
+    if (P.length !== 3) return false;
+    const ys = P.map(p => p.y), xs = P.map(p => p.x).sort((a, b) => a - b);
+    if (Math.max(...ys) - Math.min(...ys) > 0.5 * tw) return false;
+    return xs[1] - xs[0] > 0.9 * tw && xs[2] - xs[1] > 0.9 * tw;
+  }
   function isEllipseLike(c) {
     const bw = c.maxx - c.minx + 1, bh = c.maxy - c.miny + 1;
     const fill = c.area / (bw * bh);
-    return fill > 0.55 && bw / bh > 1.1 && bw / bh < 4.5;
+    return fill > 0.55 && bw / bh > 1.3 && bw / bh < 4.5;
   }
   // momenti del secondo ordine: rapporto assi e "riempimento" rispetto all'ellisse equivalente
   function ellipseStats(c) {
@@ -651,6 +776,9 @@ let running = false, isFile = false, debug = false;
 let lastRes = null, lastAnswerKey = null;
 let fpsCount = 0, fpsT = performance.now(), fps = 0, camFps = '';
 let W = 192, H = 100;
+let lowRes = false;
+// diagnostica: fotogrammi davvero consegnati dalla fotocamera e tempo di calcolo
+let presented0 = null, presentedFps = 0, procMs = 0, lastPresented = null;
 
 // ------------------------------------------------------------ zona (ROI)
 function loadRoi() { try { const r = JSON.parse(localStorage.getItem('pallina.roi')); if (r && r.w > 0.05) return r; } catch (e) {} return null; }
@@ -697,14 +825,16 @@ ov.addEventListener('pointerup', () => {
 function setEditing(on) {
   editing = on;
   $('bRoi').classList.toggle('on', on);
-  if (on) setText('', 'Trascina un rettangolo attorno al tavolo, con lo spazio sopra i bicchieri');
+  if (on) setText('', 'Trascina attorno al tavolo e ai bicchieri sollevati. Lascia fuori numero, scritte e barra gialla');
 }
 
 // ------------------------------------------------------------ avvio fotocamera / video
 async function startCamera() {
   stopSource();
+  const res = lowRes ? { width: { ideal: 640 }, height: { ideal: 480 } } : { width: { ideal: 1280 }, height: { ideal: 720 } };
   const tries = [
-    { audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60, max: 60 } } },
+    { audio: false, video: Object.assign({ facingMode: { ideal: 'environment' }, frameRate: { min: 50, ideal: 60, max: 60 } }, res) },
+    { audio: false, video: Object.assign({ facingMode: { ideal: 'environment' }, frameRate: { ideal: 60, max: 60 } }, res) },
     { audio: false, video: { facingMode: { ideal: 'environment' }, frameRate: { ideal: 60 } } },
     { audio: false, video: { facingMode: 'environment' } },
     { audio: false, video: true },
@@ -737,6 +867,7 @@ function stopSource() {
 }
 function begin() {
   resetTracker();
+  presented0 = null; presentedFps = 0;
   $('bStart').textContent = 'Riavvia';
   $('bStart').classList.remove('primary');
   if (!running) { running = true; schedule(); }
@@ -752,6 +883,11 @@ function onFrame(now, meta) {
   try {
     if (video.readyState >= 2 && video.videoWidth) {
       const mt = meta ? meta.mediaTime : video.currentTime;
+      if (meta && meta.presentedFrames != null) {
+        const n = performance.now();
+        if (!presented0) presented0 = { f: meta.presentedFrames, t: n };
+        else if (n - presented0.t > 1000) { presentedFps = (meta.presentedFrames - presented0.f) * 1000 / (n - presented0.t); presented0 = { f: meta.presentedFrames, t: n }; }
+      }
       if (meta || mt !== lastMediaTime) { lastMediaTime = mt; processFrame(isFile ? video.currentTime : now / 1000); }
     }
     draw();
@@ -772,8 +908,10 @@ function processFrame(t) {
     work.width = 192; work.height = nh; W = 192; H = nh; resetTracker();
   }
   wctx.drawImage(video, sx, sy, sw, sh, 0, 0, W, H);
+  const t0 = performance.now();
   const img = wctx.getImageData(0, 0, W, H);
   lastRes = tracker.process(img.data, W, H, t);
+  procMs = 0.9 * procMs + 0.1 * (performance.now() - t0);
   if (debug) drawDebug(img);
   fpsCount++;
   const n = performance.now();
@@ -859,7 +997,16 @@ function draw() {
     octx.strokeStyle = '#ff3b30'; octx.lineWidth = 3;
     octx.beginPath(); octx.arc(p.x, p.y, tw * 0.3, 0, Math.PI * 2); octx.stroke();
   }
-  $('stats').textContent = `${fps.toFixed(0)} fps elaborati\ncamera: ${camFps}${res.topW ? '' : '\ncalibrazione…'}`;
+  const deliv = presentedFps ? presentedFps.toFixed(0) : '?';
+  const warn = (fps > 0 && fps < 45 && !isFile) ? '\n⚠ pochi fps: più luce sullo schermo' : '';
+  $('stats').textContent = `${fps.toFixed(0)} fps elaborati · ${procMs.toFixed(1)} ms\ncamera: ${deliv} fps reali (chiesti ${camFps})${res.topW ? '' : '\ncalibrazione…'}${warn}`;
+  // in debug: mostra la fascia in cui cerca i bicchieri
+  if (debug && tracker.band) {
+    const B = tracker.band, tw0 = tracker.topW || 30;
+    const a = workToScreen(B.minX - 1.3 * tw0, B.y - 1.8 * tw0), b = workToScreen(B.maxX + 1.3 * tw0, B.y + 1.5 * tw0);
+    octx.strokeStyle = '#00e5ff80'; octx.setLineDash([4, 4]); octx.lineWidth = 1;
+    octx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y); octx.setLineDash([]);
+  }
 }
 
 function drawDebug(img) {
@@ -882,6 +1029,7 @@ $('bReset').onclick = () => { resetTracker(); setText('', 'Ricomincio: inquadra 
 $('bSet').onclick = () => { $('settings').classList.toggle('show'); $('help').classList.remove('show'); };
 $('bHelp').onclick = () => { $('help').classList.add('show'); $('settings').classList.remove('show'); };
 $('bHelpClose').onclick = () => $('help').classList.remove('show');
+$('bLow').onclick = () => { lowRes = !lowRes; $('bLow').textContent = 'Leggera: ' + (lowRes ? 'sì' : 'no'); if (video.srcObject) startCamera(); };
 $('bDebug').onclick = () => { debug = !debug; $('bDebug').textContent = 'Debug: ' + (debug ? 'sì' : 'no'); dbg.style.display = debug ? 'block' : 'none'; };
 $('file').onchange = e => { const f = e.target.files[0]; if (f) { startFile(f); $('settings').classList.remove('show'); } };
 $('thr').oninput = e => { tracker.o.manualThr = +e.target.value; $('bThrAuto').classList.remove('on'); };
