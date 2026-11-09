@@ -130,6 +130,10 @@
     settleSec: 0.3,     // secondi a bicchieri fermi prima di dare la risposta
     maxHyps: 24,
     staticFactor: 4,
+    missCost: 3,        // costo di un bicchiere non visto (es. sollevato fuori dal riquadro)
+    shareCost: 5,     // costo di due tracce sulla stessa detezione
+    minTopRatio: 0.58,  // soglia minima = 58% della luminosità dei fondi
+    thrPos: 0.65,       // posizione della soglia nell'intervallo valido (0 = basso, 1 = alto)
     minTopFrac: 0.22,   // area minima di un fondo (frazione) quando i fondi sono bianchi
     recalib: 2,         // ricalibra ogni N secondi a bicchieri fermi (0 = mai)
     adaptive: true,     // soglia che segue l'esposizione automatica
@@ -189,13 +193,19 @@
         if (r > 80 && g > 0.76 * r && g < 1.1 * r && b < 0.62 * r && r - b > 45 && g - b > 35) yellow[i] = 1;
       }
       const ref = this._refLuma(luma, blueish, w, h);
+      this.lastRef = ref;
       if (this.o.manualThr) this.thr = this.o.manualThr;
       else if (this.thr == null || this.needCalib) { this._calibrate(luma, blueish, w, h, ref); this.needCalib = false; }
       else if (this.thrRatio && ref > 0 && this.o.adaptive) {
         // l'esposizione automatica della fotocamera cambia la luminosità: la soglia la segue
-        this.refS = this.refS ? 0.92 * this.refS + 0.08 * ref : ref;
+        // se la scena si illumina di colpo (fine di un cartello oscurato) la soglia deve salire subito,
+        // altrimenti entrano corpi e bordi dei bicchieri
+        const k = !this.refS ? 1 : ref > 1.08 * this.refS ? 0.5 : 0.08;
+        this.refS = this.refS ? (1 - k) * this.refS + k * ref : ref;
         const c = this.thrCal;
         this.thr = Math.min(2.0 * c, Math.max(0.5 * c, this.thrRatio * this.refS));
+        // mai sotto una frazione della luminosità dei fondi: i corpi restano fuori anche se si schiariscono
+        if (this.tintReq) this.thr = Math.max(this.thr, this.o.minTopRatio * this.refS);
       }
       const thr = this.thr || 128;
       const top = this._topMask(luma, blueish, w, h, thr);
@@ -213,7 +223,9 @@
         y0 = Math.max(0, Math.floor(B.y - 2.2 * tw)); y1 = Math.min(h, Math.ceil(B.y + 1.5 * tw));
       }
       let n = 0;
-      for (let y = y0; y < y1; y++) for (let x = x0, i = y * w + x0; x < x1; x++, i++) if (blueish[i]) { hist[luma[i]]++; n++; }
+      const tr = this.tintReq || 0, tint = this._tint;
+      for (let y = y0; y < y1; y++) for (let x = x0, i = y * w + x0; x < x1; x++, i++)
+        if (blueish[i] && (!tr || tint[i] >= tr)) { hist[luma[i]]++; n++; }
       if (!n) return 0;
       // luminosità dei pixel più chiari pari a circa un fondo (anche con bicchieri sovrapposti
       // almeno un fondo intero si vede)
@@ -237,19 +249,27 @@
       const minA = Math.max(12, (w * h) / 900);
       const minW = 0.07 * w;                 // un fondo è almeno il 7% della larghezza del riquadro
       for (let t = 48; t <= 248; t += 8) {
+        // (senza filtro di tinta: così una tinta appresa male si corregge alla calibrazione successiva)
         const comps = components(this._topMask(luma, blueish, w, h, t, true), w, h, false).filter(c => c.area >= minA);
-        ok.push({ t, good: !!findCupTriple(comps, minW) });
+        const tri = findCupTriple(comps, minW);
+        ok.push({ t, good: !!tri, y: tri ? (tri[0].cy + tri[1].cy + tri[2].cy) / 3 : 0,
+                  tw: tri ? tri.map(c => c.maxx - c.minx + 1).sort((a, b) => a - b)[1] : 0 });
       }
       // intervalli contigui di soglie valide: si prende quello PIÙ LUMINOSO abbastanza largo
       // (i fondi sono la parte più chiara; a soglie basse si rischia di prendere i corpi)
+      // (un intervallo si spezza anche quando la terna cambia quota: fondi → corpi → bordi)
       const runs = []; let cur = null;
       for (const o of ok) {
-        if (o.good) { if (!cur) { cur = { a: o.t, b: o.t }; runs.push(cur); } else cur.b = o.t; }
+        if (o.good && cur && Math.abs(o.y - cur.y) < 0.5 * o.tw) { cur.b = o.t; }
+        else if (o.good) { cur = { a: o.t, b: o.t, y: o.y }; runs.push(cur); }
         else cur = null;
       }
       const wide = runs.filter(r => r.b - r.a >= 16);
-      const best = wide.length ? wide[wide.length - 1] : null;
+      // i fondi sono la parte PIÙ IN ALTO dei bicchieri (sotto ci sono corpi e bordi luminosi)
+      wide.sort((p, q) => (p.y - q.y) || (q.a - p.a));
+      const best = wide.length ? wide[0] : null;
       if (best) {
+        // più vicino al limite alto: margine verso corpi e bordi, che possono schiarirsi più dei fondi
         this.thr = (best.a + best.b) / 2; this.calibrated = true; this.thrCal = this.thr;
         // fissa subito la fascia dei bicchieri e la dimensione dei fondi
         const comps = components(this._topMask(luma, blueish, w, h, this.thr, true), w, h, true).filter(c => c.area >= minA);
@@ -270,6 +290,8 @@
           tv.sort((a, b) => a - b);
           const med = tv.length ? tv[tv.length >> 1] : 0;
           this.tintReq = med >= 60 ? Math.round(med * 0.45) : 0;
+          // fondi azzurri (bordi e corpi possono schiarirsi quanto loro): soglia più alta nell'intervallo
+          if (this.tintReq) { this.thr = best.a + this.o.thrPos * (best.b - best.a); this.thrCal = this.thr; }
           ref = this._refLuma(luma, blueish, w, h);
         }
         this.thrRatio = ref > 0 ? this.thr / ref : null;
@@ -340,7 +362,7 @@
     _assignments(T, dets, maxOut) {
       const tw = this.topW || 30, tw2 = tw * tw;
       const D = dets.length, nT = T.length;
-      const MISS = 6, SHARE = 1.0, UNUSED = 1.5, GATE = 3.5 * 3.5;
+      const MISS = this.o.missCost, SHARE = this.o.shareCost, UNUSED = 1.5, GATE = 3.5 * 3.5;
       // due modelli: velocità costante oppure fermo (i movimenti partono e si
       // fermano di colpo); vale il più favorevole
       const cm = T.map(t => dets.map(d => {
@@ -436,6 +458,9 @@
                       ball.y > B.y - 1.2 * twb && ball.y < B.y + 2.8 * twb)) ball = null;
       }
       this.badFrames = dets.length === this.o.nCups ? 0 : this.badFrames + 1;
+      // quota di fotogrammi con esattamente 3 fondi: se resta bassa la calibrazione è sbagliata → rifalla
+      this.goodRate = this.goodRate == null ? 1 : 0.98 * this.goodRate + 0.02 * (dets.length === this.o.nCups ? 1 : 0);
+      if (this.calibrated && this.goodRate < 0.5 && this.t - (this.lastCalibT || 0) > 2) { this.needCalib = true; this.goodRate = 0.75; }
       if ((!this.calibrated && this.frame % 30 === 0) || this.badFrames > 90) { this.needCalib = true; this.badFrames = 0; }
       const tw = this.topW || 30;
 
@@ -505,7 +530,8 @@
           if (this.offFrames > 12) { this._initTracks(dets); this.offFrames = 0; }
         }
         // ricalibrazione periodica a bicchieri fermi (l'esposizione e l'inquadratura cambiano)
-        if (this.o.recalib && this.stillFrames > 6 && !this.ep && this.t - (this.lastCalibT || 0) > this.o.recalib) this.needCalib = true;
+        const steady = !this.refS || !this.lastRef || Math.abs(this.lastRef - this.refS) < 0.12 * this.refS;
+        if (this.o.recalib && steady && this.stillFrames > 6 && !this.ep && this.t - (this.lastCalibT || 0) > this.o.recalib) this.needCalib = true;
         if (this.stillFrames > 5 && !ball) {
           const my = T0mean(this.hyps[0].tracks);
           this.baseY = this.baseY == null ? my : 0.9 * this.baseY + 0.1 * my;
@@ -770,7 +796,7 @@
   }
 
   root.ShellTracker = ShellTracker;
-  if (typeof module !== 'undefined' && module.exports) module.exports = { ShellTracker };
+  if (typeof module !== "undefined" && module.exports) module.exports = { ShellTracker, _t: { components, ellipseStats, erode } };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
